@@ -1,472 +1,270 @@
-"""
-Trabajo Práctico 3 - Procesamiento de Imágenes
-Detección de dados en videos usando componentes conectados
-
-Este script procesa videos de tiradas de dados y:
-- Detecta automáticamente cuando los dados están quietos
-- Cuenta los puntos en cada dado
-- Genera videos con bounding boxes y valores detectados
-"""
-
 import cv2
 import numpy as np
 import os
-from pathlib import Path
 
-# ============================================================================
-# CONFIGURACIÓN GLOBAL
-# ============================================================================
+def calcular_params_dados(w_frame, h_frame):
+    area_frame = w_frame * h_frame
+    area_min = int(area_frame * 0.0015)
+    area_max = int(area_frame * 0.0025)
+    dist_max = int(w_frame * 0.05)
+    grosor = max(2, w_frame // 200)
+    return area_min, area_max, dist_max, grosor
 
-# Rutas de archivos
-CARPETA_VIDEOS = "videos"
-CARPETA_SALIDA = "datos_salida"
+def validar_dado(area, w, h, area_min, area_max):
+    ratio = h / w
+    return area_min < area < area_max and 0.7 < ratio < 1.2
 
-# Parámetros de detección
-UMBRAL_ROJO = 80              # Umbral para binarizar canal rojo
-AREA_MIN_DADO = 3700          # Área mínima de un dado en píxeles
-AREA_MAX_DADO = 5500          # Área máxima de un dado en píxeles
-ASPECT_MIN = 0.7              # Relación de aspecto mínima (h/w)
-ASPECT_MAX = 1.2              # Relación de aspecto máxima
+def contar_puntos(recorte):
+    gris = cv2.cvtColor(recorte, cv2.COLOR_RGB2GRAY)
+    umbral, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-# Parámetros para puntos del dado
-UMBRAL_PUNTOS = 120           # Umbral para detectar puntos blancos
-AREA_MIN_PUNTO = 60           # Área mínima de un punto
-AREA_MAX_PUNTO = 160          # Área máxima de un punto
-ASPECT_MIN_PUNTO = 0.6        # Aspecto mínimo de un punto
-ASPECT_MAX_PUNTO = 1.2        # Aspecto máximo de un punto
+    n_comp, _, stats, _ = cv2.connectedComponentsWithStats(binaria, connectivity=4)
 
-# Parámetros de movimiento
-FRAMES_ENTRE_COMPARACIONES = 19    # Cada cuántos frames comparar posiciones
-DISTANCIA_MAX_MOVIMIENTO = 80      # Distancia máxima para considerar mismo dado
+    count = 0
+    for i in range(1, n_comp):
+        area = stats[i, cv2.CC_STAT_AREA]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        ratio = h / w if w > 0 else 0
 
-# Parámetros de visualización
-ESCALA_VIDEO = 3              # Factor de reducción del video de salida
-FRAME_MUESTRA = 80            # Frame donde mostrar pasos intermedios
+        if 60 < area < 160 and 0.6 < ratio < 1.2:
+            count += 1
 
+    return count
 
-# ============================================================================
-# FUNCIONES AUXILIARES
-# ============================================================================
-
-def crear_carpeta_salida():
-    """Crea la carpeta de salida si no existe"""
-    if not os.path.exists(CARPETA_SALIDA):
-        os.makedirs(CARPETA_SALIDA)
-        print(f"[INFO] Carpeta '{CARPETA_SALIDA}' creada")
-
-
-def obtener_videos():
-    """
-    Obtiene la lista de videos a procesar
-    Retorna: lista de rutas a los videos
-    """
-    videos = []
-    if os.path.exists(CARPETA_VIDEOS):
-        for archivo in sorted(os.listdir(CARPETA_VIDEOS)):
-            if archivo.endswith('.mp4'):
-                ruta = os.path.join(CARPETA_VIDEOS, archivo)
-                videos.append(ruta)
-
-    if len(videos) == 0:
-        print(f"[ADVERTENCIA] No se encontraron videos en '{CARPETA_VIDEOS}'")
-    else:
-        print(f"[INFO] Se encontraron {len(videos)} videos")
-
-    return videos
-
-
-def filtrar_canal_rojo(frame):
-    """
-    Satura los canales verde y azul, dejando solo el rojo
-
-    Por qué: Los dados son rojos sobre fondo verde/celeste.
-    Al eliminar verde y azul, los dados se destacan mucho más.
-
-    Args:
-        frame: imagen BGR de OpenCV
-
-    Returns:
-        frame_rojo: imagen con solo canal rojo
-    """
-    frame_rojo = frame.copy()
-    frame_rojo[:, :, 0] = 0  # Canal azul a 0
-    frame_rojo[:, :, 1] = 0  # Canal verde a 0
-    # frame_rojo[:, :, 2] queda igual (canal rojo)
-
-    return frame_rojo
-
-
-def binarizar_imagen(imagen_gris, umbral):
-    """
-    Convierte una imagen en escala de grises a binaria
-
-    Píxeles > umbral → 255 (blanco)
-    Píxeles <= umbral → 0 (negro)
-
-    Args:
-        imagen_gris: imagen en escala de grises
-        umbral: valor de corte
-
-    Returns:
-        imagen_binaria: imagen con solo valores 0 y 255
-    """
-    _, img_bin = cv2.threshold(imagen_gris, umbral, 255, cv2.THRESH_BINARY)
-    return img_bin
-
-
-def es_dado_valido(area, ancho, alto):
-    """
-    Determina si un componente conectado es un dado basándose en su geometría
-
-    Criterios:
-    - Área entre 3700 y 5500 píxeles (tamaño apropiado)
-    - Relación de aspecto cercana a 1 (casi cuadrado)
-
-    Args:
-        area: área del componente en píxeles
-        ancho: ancho del componente
-        alto: alto del componente
-
-    Returns:
-        True si cumple criterios de dado, False en caso contrario
-    """
-    relacion_aspecto = alto / ancho
-
-    cumple_area = AREA_MIN_DADO < area < AREA_MAX_DADO
-    cumple_aspecto = ASPECT_MIN < relacion_aspecto < ASPECT_MAX
-
-    return cumple_area and cumple_aspecto
-
-
-def contar_puntos_dado(recorte_dado):
-    """
-    Cuenta los puntos blancos en la cara de un dado
-
-    Proceso:
-    1. Convertir a escala de grises
-    2. Binarizar para resaltar puntos blancos
-    3. Encontrar componentes conectados
-    4. Filtrar por área y relación de aspecto
-    5. Contar componentes válidos
-
-    Args:
-        recorte_dado: imagen RGB del dado recortado
-
-    Returns:
-        cantidad de puntos detectados (1-6)
-    """
-    # Convertir a escala de grises
-    gris = cv2.cvtColor(recorte_dado, cv2.COLOR_RGB2GRAY)
-
-    # Binarizar para resaltar puntos blancos
-    binaria = binarizar_imagen(gris, UMBRAL_PUNTOS)
-
-    # Detectar componentes conectados
-    num_componentes, etiquetas, estadisticas, centroides = \
-        cv2.connectedComponentsWithStats(binaria, connectivity=4)
-
-    puntos_validos = 0
-
-    # Revisar cada componente (empezar en 1 para saltar el fondo)
-    for i in range(1, num_componentes):
-        area = estadisticas[i, cv2.CC_STAT_AREA]
-        ancho = estadisticas[i, cv2.CC_STAT_WIDTH]
-        alto = estadisticas[i, cv2.CC_STAT_HEIGHT]
-
-        # Calcular relación de aspecto
-        relacion = alto / ancho if ancho > 0 else 0
-
-        # Verificar si es un punto válido
-        if (AREA_MIN_PUNTO < area < AREA_MAX_PUNTO and
-            ASPECT_MIN_PUNTO < relacion < ASPECT_MAX_PUNTO):
-            puntos_validos += 1
-
-    return puntos_validos
-
-
-def calcular_distancia(x1, y1, x2, y2):
-    """
-    Calcula la distancia euclidiana entre dos puntos
-
-    Fórmula: d = √[(x1-x2)² + (y1-y2)²]
-
-    Por qué: Para determinar si un dado se movió entre frames.
-    Si la distancia es pequeña, es el mismo dado en reposo.
-    """
-    return np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
-
-
-def dibujar_dado(frame, x, y, ancho, alto, valor):
-    """
-    Dibuja un rectángulo y el valor del dado en el frame
-
-    Args:
-        frame: imagen donde dibujar
-        x, y: coordenadas superior izquierda
-        ancho, alto: dimensiones del rectángulo
-        valor: número de puntos del dado
-
-    Returns:
-        frame con el dado dibujado
-    """
-    # Dibujar rectángulo amarillo
-    cv2.rectangle(frame, (x, y), (x + ancho, y + alto),
-                  (255, 255, 0), thickness=10)
-
-    # Escribir el valor arriba del dado
-    cv2.putText(frame, str(valor), (x, y - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 2)
-
+def draw_dado(frame, x, y, w, h, val, grosor):
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), thickness=grosor)
+    font_size = grosor / 10
+    cv2.putText(frame, str(val), (x, y - grosor*2), cv2.FONT_HERSHEY_SIMPLEX, font_size, (255, 255, 0), 2)
     return frame
 
+def analizar_frame_optimizado(frame, area_min, area_max):
+    canal_rojo = frame[:, :, 2]
+    _, binario = cv2.threshold(canal_rojo, 80, 255, cv2.THRESH_BINARY)
 
-def misma_posicion(dado_actual, dado_previo):
-    """
-    Verifica si dos dados están en la misma posición
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(binario, connectivity=8)
 
-    Args:
-        dado_actual: tupla (x, y, w, h, recorte)
-        dado_previo: tupla (x, y, w, h, recorte)
+    dados = []
+    for i in range(1, n_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
 
-    Returns:
-        True si están en la misma posición (distancia < umbral)
-    """
-    x1, y1 = dado_actual[0], dado_actual[1]
-    x2, y2 = dado_previo[0], dado_previo[1]
+        if validar_dado(area, w, h, area_min, area_max):
+            crop = frame[y:y+h, x:x+w].copy()
+            pts = contar_puntos(crop)
+            dados.append((x, y, w, h, crop, pts))
 
-    distancia = calcular_distancia(x1, y1, x2, y2)
+    return dados, binario
 
-    return distancia < DISTANCIA_MAX_MOVIMIENTO
-
-
-# ============================================================================
-# FUNCIÓN PRINCIPAL DE PROCESAMIENTO
-# ============================================================================
-
-def procesar_video(ruta_video, indice):
-    """
-    Procesa un video completo, detectando dados y generando salida
-
-    Pasos:
-    1. Abrir video y obtener propiedades
-    2. Crear video de salida
-    3. Para cada frame:
-       a. Filtrar canal rojo
-       b. Binarizar
-       c. Detectar componentes conectados
-       d. Filtrar dados válidos
-       e. Comparar con frame anterior
-       f. Dibujar dados quietos
-       g. Escribir frame procesado
-
-    Args:
-        ruta_video: path del video a procesar
-        indice: número del video (para nombrar salida)
-    """
-    print(f"\n[PROCESANDO] Video {indice}: {ruta_video}")
-
-    # Abrir video
-    captura = cv2.VideoCapture(ruta_video)
-    if not captura.isOpened():
-        print(f"[ERROR] No se pudo abrir el video: {ruta_video}")
+def procesar_video(video_path, idx, guardar_video=False):
+    print(f"\nProcesando video {idx}: {video_path}")
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error abriendo video: {video_path}")
         return
 
-    # Obtener propiedades del video
-    fps = int(captura.get(cv2.CAP_PROP_FPS))
-    ancho_original = int(captura.get(cv2.CAP_PROP_FRAME_WIDTH))
-    alto_original = int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(captura.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    w_orig = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h_orig = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    print(f"  - Resolución: {ancho_original}x{alto_original}")
-    print(f"  - FPS: {fps}")
-    print(f"  - Total frames: {total_frames}")
+    print(f"  {w_orig}x{h_orig}, {fps} fps, {total} frames")
 
-    # Calcular dimensiones del video de salida
-    ancho_salida = ancho_original // ESCALA_VIDEO
-    alto_salida = alto_original // ESCALA_VIDEO
+    area_min, area_max, dist_max, grosor = calcular_params_dados(w_orig, h_orig)
+    print(f"  Parametros: area=[{area_min}, {area_max}], dist_max={dist_max}")
 
-    # Crear video de salida
-    nombre_salida = os.path.join(CARPETA_SALIDA, f"video_{indice}_procesado.mp4")
-    escritor = cv2.VideoWriter(nombre_salida,
-                               cv2.VideoWriter_fourcc(*'mp4v'),
-                               fps, (ancho_salida, alto_salida))
+    print(f"\n  Buscando frame con 5 dados validos...")
 
-    # Variables para seguimiento
-    dados_previos = []
-    contador_frames = 0
-    frame_actual = 0
-    dados_detectados_previo = set()  # Para no repetir detecciones
-    mostrar_visualizacion = True  # Flag para mostrar pasos intermedios
+    mejor_frame = None
+    mejor_frame_num = 0
+    mejor_dados = []
+    encontrado = False
 
-    print("  - Procesando frames...")
+    frame_inicio = int(total * 0.2)
+    frame_paso = 10
 
-    # Procesar cada frame
-    while captura.isOpened():
-        ret, frame = captura.read()
+    for frame_num in range(frame_inicio, total, frame_paso):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
         if not ret:
             break
 
-        frame_actual += 1
+        dados, _ = analizar_frame_optimizado(frame, area_min, area_max)
 
-        # Copiar frame original para dibujar
-        frame_original = frame.copy()
+        if len(dados) == 5:
+            puntos_dados = [d[5] for d in dados]
+            if all(p > 0 for p in puntos_dados):
+                print(f"    Frame {frame_num}: 5 dados validos! Puntos: {puntos_dados}")
+                mejor_frame = frame
+                mejor_frame_num = frame_num
+                mejor_dados = dados
+                encontrado = True
+                break
+            else:
+                dados_sin_puntos = sum(1 for p in puntos_dados if p == 0)
+                print(f"    Frame {frame_num}: 5 dados pero {dados_sin_puntos} sin puntos")
+        elif len(dados) < 5:
+            print(f"    Frame {frame_num}: Solo {len(dados)} dados")
 
-        # PASO 1: Filtrar canal rojo
-        frame_rojo = filtrar_canal_rojo(frame)
+    if not encontrado:
+        print(f"\n  [ADVERTENCIA] No se encontraron 5 dados validos")
+        print(f"  Usando frame al 70% del video...")
 
-        # PASO 2: Binarizar el canal rojo
-        canal_rojo = frame_rojo[:, :, 2]  # Extraer solo canal rojo
-        frame_binario = binarizar_imagen(canal_rojo, UMBRAL_ROJO)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.7))
+        ret, frame = cap.read()
+        if ret:
+            mejor_frame = frame
+            mejor_frame_num = int(total * 0.7)
+            mejor_dados, _ = analizar_frame_optimizado(frame, area_min, area_max)
 
-        # PASO 3: Detectar componentes conectados
-        num_labels, etiquetas, stats, centroides = \
-            cv2.connectedComponentsWithStats(frame_binario, connectivity=8)
+    if mejor_frame is not None and len(mejor_dados) > 0:
+        print(f"\n  Resultado: Frame {mejor_frame_num} con {len(mejor_dados)} dados")
 
-        # PASO 4: Filtrar dados válidos
-        dados_actuales = []
+        frame_resultado = mejor_frame.copy()
+        for i, dado in enumerate(mejor_dados, 1):
+            x, y, w, h, crop, pts = dado
+            print(f"    Dado {i} (x={x}): {pts} puntos")
+            frame_resultado = draw_dado(frame_resultado, x, y, w, h, pts, grosor)
 
-        for i in range(1, num_labels):  # Saltar el fondo (índice 0)
-            x = stats[i, cv2.CC_STAT_LEFT]
-            y = stats[i, cv2.CC_STAT_TOP]
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            area = stats[i, cv2.CC_STAT_AREA]
+        print(f"\n  Mostrando visualizacion...")
+        try:
+            import matplotlib.pyplot as plt
 
-            # Verificar si es un dado
-            if es_dado_valido(area, w, h):
-                # Recortar el dado del frame original
-                recorte = frame_original[y:y+h, x:x+w]
-                dados_actuales.append((x, y, w, h, recorte))
+            canal_rojo_viz = mejor_frame[:, :, 2]
+            _, binario_viz = cv2.threshold(canal_rojo_viz, 80, 255, cv2.THRESH_BINARY)
 
-        # PASO 5: Comparar con dados previos y dibujar si están quietos
-        dados_quietos = []  # Lista de dados quietos en este frame
+            rojo_viz = mejor_frame.copy()
+            rojo_viz[:, :, 0] = 0
+            rojo_viz[:, :, 1] = 0
 
-        for dado_actual in dados_actuales:
-            for dado_previo in dados_previos:
-                if misma_posicion(dado_actual, dado_previo):
-                    # El dado está quieto, contamos sus puntos
-                    x, y, w, h, recorte = dado_actual
-                    puntos = contar_puntos_dado(recorte)
+            fig, axs = plt.subplots(2, 2, figsize=(14, 11))
+            fig.suptitle(f'Video {idx} - Frame {mejor_frame_num}\n{len(mejor_dados)} Dados Detectados',
+                        fontsize=16, fontweight='bold')
 
-                    # Guardar para mostrar por terminal
-                    dados_quietos.append((x, y, puntos))
+            axs[0, 0].imshow(cv2.cvtColor(mejor_frame, cv2.COLOR_BGR2RGB))
+            axs[0, 0].set_title('Original')
+            axs[0, 0].axis('off')
 
-                    # Dibujar en el frame
-                    frame_original = dibujar_dado(frame_original, x, y, w, h, puntos)
-                    break  # Ya encontramos match, pasar al siguiente dado
+            axs[0, 1].imshow(cv2.cvtColor(rojo_viz, cv2.COLOR_BGR2RGB))
+            axs[0, 1].set_title('Canal Rojo')
+            axs[0, 1].axis('off')
 
-        # Mostrar detecciones por terminal cuando hay dados quietos
-        if dados_quietos and len(dados_quietos) == 5:  # Los 5 dados quietos
-            # Crear identificador único para este set de dados
-            valores_ordenados = tuple(sorted([p for _, _, p in dados_quietos]))
+            axs[1, 0].imshow(binario_viz, cmap='gray')
+            axs[1, 0].set_title(f'Binarizada (umbral=80)')
+            axs[1, 0].axis('off')
 
-            # Solo mostrar si es diferente al anterior
-            if valores_ordenados != dados_detectados_previo:
-                dados_detectados_previo = valores_ordenados
-                print(f"\n  [FRAME {frame_actual}] Dados detenidos detectados:")
-                for idx, (x, y, valor) in enumerate(sorted(dados_quietos, key=lambda d: d[0]), 1):
-                    print(f"    Dado #{idx} (posicion x={x}): {valor} puntos")
-                print(f"    Total: {sum([p for _, _, p in dados_quietos])} puntos")
+            axs[1, 1].imshow(cv2.cvtColor(frame_resultado, cv2.COLOR_BGR2RGB))
+            puntos_str = ', '.join([str(d[5]) for d in mejor_dados])
+            axs[1, 1].set_title(f'Detectados: [{puntos_str}]')
+            axs[1, 1].axis('off')
 
-        # Visualización de pasos intermedios (cuando detecta 5 dados quietos)
-        if mostrar_visualizacion and len(dados_quietos) == 5:
-            print(f"\n  [VISUALIZACION] Mostrando pasos de procesamiento (Video {indice}, Frame {frame_actual})...")
-            try:
-                import matplotlib.pyplot as plt
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"    Error mostrando viz: {e}")
 
-                fig, axes = plt.subplots(2, 2, figsize=(14, 11))
-                titulo = f'Video {indice} - Pasos de Procesamiento - Frame {frame_actual}\n5 Dados Detectados en Reposo'
-                fig.suptitle(titulo, fontsize=16, fontweight='bold')
+    if guardar_video:
+        print(f"\n  Generando video procesado...")
 
-                # Imagen original
-                axes[0, 0].imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                axes[0, 0].set_title('1. Imagen Original', fontsize=12)
-                axes[0, 0].axis('off')
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-                # Canal rojo filtrado
-                axes[0, 1].imshow(cv2.cvtColor(frame_rojo, cv2.COLOR_BGR2RGB))
-                axes[0, 1].set_title('2. Solo Canal Rojo (Verde y Azul = 0)', fontsize=12)
-                axes[0, 1].axis('off')
+        w_out = w_orig // 3
+        h_out = h_orig // 3
 
-                # Imagen binarizada
-                axes[1, 0].imshow(frame_binario, cmap='gray')
-                axes[1, 0].set_title('3. Binarizada (Umbral = 80)', fontsize=12)
-                axes[1, 0].axis('off')
+        if not os.path.exists("datos_salida"):
+            os.makedirs("datos_salida")
 
-                # Resultado final con detecciones
-                axes[1, 1].imshow(cv2.cvtColor(frame_original, cv2.COLOR_BGR2RGB))
-                valores_str = ', '.join([str(p) for _, _, p in sorted(dados_quietos, key=lambda d: d[0])])
-                axes[1, 1].set_title(f'4. Dados Detectados\nValores: [{valores_str}]', fontsize=12)
-                axes[1, 1].axis('off')
+        out_name = os.path.join("datos_salida", f"video_{idx}_procesado.mp4")
+        writer = cv2.VideoWriter(out_name, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w_out, h_out))
 
-                plt.tight_layout()
-                plt.show()
-                print(f"  [VISUALIZACION] Ventana mostrada. Cierra la ventana para continuar...")
+        dados_prev = []
+        cont = 0
+        frame_n = 0
 
-                mostrar_visualizacion = False  # Mostrar solo una vez por video
-            except ImportError:
-                print("    (matplotlib no disponible para visualizacion)")
-            except Exception as e:
-                print(f"    (error en visualizacion: {e})")
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        # PASO 6: Actualizar dados previos cada N frames
-        contador_frames += 1
-        if contador_frames >= FRAMES_ENTRE_COMPARACIONES:
-            dados_previos = dados_actuales
-            contador_frames = 0
+            frame_n += 1
 
-        # PASO 7: Escalar y escribir frame
-        frame_escalado = cv2.resize(frame_original,
-                                    (ancho_salida, alto_salida))
-        escritor.write(frame_escalado)
+            canal_r = frame[:, :, 2]
+            _, binario = cv2.threshold(canal_r, 80, 255, cv2.THRESH_BINARY)
+            n_labels, _, stats, _ = cv2.connectedComponentsWithStats(binario, connectivity=8)
 
-        # Mostrar progreso
-        if frame_actual % 50 == 0:
-            progreso = (frame_actual / total_frames) * 100
-            print(f"    Progreso: {progreso:.1f}% ({frame_actual}/{total_frames})")
+            dados_ahora = []
+            for i in range(1, n_labels):
+                x = stats[i, cv2.CC_STAT_LEFT]
+                y = stats[i, cv2.CC_STAT_TOP]
+                w = stats[i, cv2.CC_STAT_WIDTH]
+                h = stats[i, cv2.CC_STAT_HEIGHT]
+                area = stats[i, cv2.CC_STAT_AREA]
 
-    # Liberar recursos
-    captura.release()
-    escritor.release()
+                if validar_dado(area, w, h, area_min, area_max):
+                    dados_ahora.append((x, y, w, h))
 
-    print(f"  - Video procesado guardado en: {nombre_salida}")
+            quietos = []
+            if len(dados_prev) > 0:
+                for d_ahora in dados_ahora:
+                    x1, y1 = d_ahora[0], d_ahora[1]
+                    for d_prev in dados_prev:
+                        x2, y2 = d_prev[0], d_prev[1]
+                        dist = np.sqrt((x1-x2)**2 + (y1-y2)**2)
+                        if dist < dist_max:
+                            x, y, w, h = d_ahora
+                            crop = frame[y:y+h, x:x+w]
+                            pts = contar_puntos(crop)
+                            quietos.append((x, y, w, h, pts))
+                            break
 
+            frame_dibujado = frame.copy()
+            for x, y, w, h, pts in quietos:
+                frame_dibujado = draw_dado(frame_dibujado, x, y, w, h, pts, grosor)
 
-# ============================================================================
-# PROGRAMA PRINCIPAL
-# ============================================================================
+            cont += 1
+            if cont >= 5:
+                dados_prev = dados_ahora
+                cont = 0
+
+            out_frame = cv2.resize(frame_dibujado, (w_out, h_out))
+            writer.write(out_frame)
+
+            if frame_n % 50 == 0:
+                prog = (frame_n / total) * 100
+                print(f"    {prog:.1f}% ({frame_n}/{total})")
+
+        cap.release()
+        writer.release()
+        print(f"  Guardado: {out_name}")
+    cap.release()
 
 def main():
-    """
-    Función principal que coordina todo el procesamiento
-    """
     print("=" * 70)
-    print("TRABAJO PRÁCTICO 3 - DETECCIÓN DE DADOS EN VIDEOS")
-    print("Procesamiento de Imágenes - TUIA")
+    print("TP3 - DETECCION DE DADOS")
+    print("PDI - TUIA")
     print("=" * 70)
 
-    # Crear carpeta de salida
-    crear_carpeta_salida()
+    videos = []
+    if os.path.exists("videos"):
+        for f in sorted(os.listdir("videos")):
+            if f.endswith('.mp4'):
+                videos.append(os.path.join("videos", f))
 
-    # Obtener lista de videos
-    videos = obtener_videos()
-
-    if len(videos) == 0:
-        print("\n[ERROR] No hay videos para procesar")
-        print(f"Coloque los videos en la carpeta '{CARPETA_VIDEOS}'")
+    if not videos:
+        print("\nNo hay videos en la carpeta 'videos'")
         return
 
-    # Procesar cada video
-    print(f"\nSe procesarán {len(videos)} video(s)")
+    print(f"\nSe van a procesar {len(videos)} video(s)\n")
 
-    for idx, video in enumerate(videos, start=1):
-        procesar_video(video, idx)
+    for i, vid in enumerate(videos, 1):
+        procesar_video(vid, i, guardar_video=False)
 
     print("\n" + "=" * 70)
-    print("PROCESAMIENTO COMPLETADO")
-    print(f"Los videos procesados están en la carpeta '{CARPETA_SALIDA}'")
+    print("PROCESAMIENTO COMPLETO")
     print("=" * 70)
-
 
 if __name__ == "__main__":
     main()
